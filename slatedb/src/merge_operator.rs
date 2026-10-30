@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     error::SlateDBError,
-    iter::{RowEntryIterator, TrackedRowEntryIterator},
+    iter::{IterationOrder, RowEntryIterator, TrackedRowEntryIterator},
     read_trace::ReadTrace,
     types::{RowEntry, ValueDeletable},
     utils::merge_options,
@@ -251,6 +251,8 @@ pub(crate) struct MergeOperatorIterator<T: RowEntryIterator> {
     /// A barrier sequence number that supports snapshot reads using this iterator. If not None,
     /// the iterator will not merge entries with sequence number greater than this value.
     snapshot_barrier_seq: Option<u64>,
+    /// The order of the delegate. `seek` uses it to decide if `buffered_entry` is still ahead.
+    order: IterationOrder,
 }
 
 /// Tracks metadata across multiple entries during merge operations.
@@ -321,7 +323,14 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             buffered_entry: None,
             merge_different_expire_ts,
             snapshot_barrier_seq,
+            order: IterationOrder::Ascending,
         }
+    }
+
+    /// Sets the order of the delegate. The default is ascending.
+    pub(crate) fn with_order(mut self, order: IterationOrder) -> Self {
+        self.order = order;
+        self
     }
 }
 
@@ -490,7 +499,18 @@ impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorIterator<T> {
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
-        self.buffered_entry = None;
+        // A merge reads the first entry of the next key ahead, so the delegate is already past
+        // it. Keep it if it is at or past `next_key` in the scan order.
+        if let Some(entry) = &self.buffered_entry {
+            let at_or_past_next_key = match self.order {
+                IterationOrder::Ascending => entry.key.as_ref() >= next_key,
+                IterationOrder::Descending => entry.key.as_ref() <= next_key,
+            };
+            if at_or_past_next_key {
+                return Ok(());
+            }
+            self.buffered_entry = None;
+        }
         self.delegate.seek(next_key).await
     }
 }
@@ -511,7 +531,7 @@ mod tests {
     use super::*;
     use crate::{
         config::TracingOptions,
-        test_utils::{assert_iterator, SpanRecorder},
+        test_utils::{assert_iterator, SpanRecorder, TestIterator},
     };
 
     struct MockMergeOperator;
@@ -821,6 +841,47 @@ mod tests {
             iterator.next().await.unwrap().is_none(),
             "seek should not return a stale buffered entry"
         );
+    }
+
+    #[rstest]
+    #[case::ascending(IterationOrder::Ascending, b"key1", b"key2", b"key3")]
+    #[case::descending(IterationOrder::Descending, b"key3", b"key2", b"key1")]
+    #[tokio::test]
+    async fn test_seek_after_merged_value_keeps_buffered_next_key(
+        #[case] order: IterationOrder,
+        #[case] merged_key: &'static [u8],
+        #[case] next_key: &'static [u8],
+        #[case] last_key: &'static [u8],
+    ) {
+        let delegate = TestIterator::new()
+            .with_order(order)
+            .with_row_entry(RowEntry::new_merge(merged_key, b"2", 2))
+            .with_row_entry(RowEntry::new_merge(merged_key, b"1", 1))
+            .with_row_entry(RowEntry::new_value(next_key, b"v3", 3))
+            .with_row_entry(RowEntry::new_value(last_key, b"v4", 4));
+        let mut iterator = MergeOperatorIterator::new(
+            Arc::new(MockMergeOperator {}),
+            delegate,
+            true,
+            None,
+            ReadTrace::none(),
+        )
+        .with_order(order);
+        iterator.init().await.unwrap();
+        let merged = iterator.next().await.unwrap().unwrap();
+        assert_eq!(merged.key.as_ref(), merged_key);
+
+        // The merge read the first entry of `next_key` ahead. The seek must keep it.
+        iterator.seek(next_key).await.unwrap();
+
+        assert_iterator(
+            &mut iterator,
+            vec![
+                RowEntry::new_value(next_key, b"v3", 3),
+                RowEntry::new_value(last_key, b"v4", 4),
+            ],
+        )
+        .await;
     }
 
     #[derive(Debug)]

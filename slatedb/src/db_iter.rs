@@ -307,16 +307,19 @@ impl DbIterator {
         };
 
         if let Some(merge_operator) = merge_operator {
-            iter = Box::new(MergeOperatorIterator::new(
-                merge_operator,
-                iter,
-                true,
-                // Its important not to set a snapshot seq num barrier for this merge iterator
-                // The entries in the write batch iterator have seq num u64::MAX and any merges
-                // there need to be merged with the entries from the other iterators.
-                None,
-                read_trace,
-            ));
+            iter = Box::new(
+                MergeOperatorIterator::new(
+                    merge_operator,
+                    iter,
+                    true,
+                    // Its important not to set a snapshot seq num barrier for this merge iterator
+                    // The entries in the write batch iterator have seq num u64::MAX and any merges
+                    // there need to be merged with the entries from the other iterators.
+                    None,
+                    read_trace,
+                )
+                .with_order(order),
+            );
         } else {
             // When no merge operator is configured, wrap with iterator that errors on merge operands
             iter = Box::new(MergeOperatorRequiredIterator::new(iter));
@@ -789,6 +792,55 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(iter.next().await.unwrap(), None);
         }
+    }
+
+    #[rstest]
+    #[case::ascending(IterationOrder::Ascending, [b"a", b"b", b"c"])]
+    #[case::descending(IterationOrder::Descending, [b"c", b"b", b"a"])]
+    #[tokio::test]
+    async fn test_seek_after_merged_value(
+        #[case] order: IterationOrder,
+        #[case] keys: [&'static [u8; 1]; 3],
+        #[values(false, true)] skip_next_key: bool,
+    ) {
+        let [merged_key, next_key, last_key] = keys;
+        let mem_iter = TestIterator::new()
+            .with_order(order)
+            .with_row_entry(RowEntry::new_merge(merged_key, b"2", 2))
+            .with_row_entry(RowEntry::new_merge(merged_key, b"1", 1))
+            .with_entry(next_key, b"next", 3)
+            .with_entry(last_key, b"last", 4);
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            vec![Box::new(mem_iter) as Box<dyn RowEntryIterator>],
+            Box::new(EmptyIterator::new()),
+            None,
+            Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType),
+            order,
+            ReadTrace::none(),
+        )
+        .await
+        .unwrap();
+        let merged = iter.next().await.unwrap().unwrap();
+        assert_eq!(
+            (merged.key.as_ref(), merged.value.as_ref()),
+            (&merged_key[..], &b"12"[..])
+        );
+
+        // The merge read `next_key` ahead. A seek to it keeps the entry, and a seek past it drops it.
+        let (seek_key, expected): (&[u8], Vec<&[u8]>) = if skip_next_key {
+            (last_key, vec![last_key])
+        } else {
+            (next_key, vec![next_key, last_key])
+        };
+        iter.seek(seek_key).await.unwrap();
+
+        let mut got = Vec::new();
+        while let Some(kv) = iter.next().await.unwrap() {
+            got.push(kv.key);
+        }
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]

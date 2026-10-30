@@ -307,16 +307,19 @@ impl DbIterator {
         };
 
         if let Some(merge_operator) = merge_operator {
-            iter = Box::new(MergeOperatorIterator::new(
-                merge_operator,
-                iter,
-                true,
-                // Its important not to set a snapshot seq num barrier for this merge iterator
-                // The entries in the write batch iterator have seq num u64::MAX and any merges
-                // there need to be merged with the entries from the other iterators.
-                None,
-                read_trace,
-            ));
+            iter = Box::new(
+                MergeOperatorIterator::new(
+                    merge_operator,
+                    iter,
+                    true,
+                    // Its important not to set a snapshot seq num barrier for this merge iterator
+                    // The entries in the write batch iterator have seq num u64::MAX and any merges
+                    // there need to be merged with the entries from the other iterators.
+                    None,
+                    read_trace,
+                )
+                .with_order(order),
+            );
         } else {
             // When no merge operator is configured, wrap with iterator that errors on merge operands
             iter = Box::new(MergeOperatorRequiredIterator::new(iter));
@@ -385,6 +388,21 @@ impl DbIterator {
         }
     }
 
+    /// Returns an error if `next_key` is at or before the last returned key
+    /// in the scan order.
+    fn rewind_error(&self, next_key: &[u8]) -> Option<SlateDBError> {
+        let last_key = self.last_key.as_ref()?;
+        match self.order {
+            IterationOrder::Ascending if next_key <= last_key.as_ref() => {
+                Some(SlateDBError::SeekKeyLessThanLastReturnedKey)
+            }
+            IterationOrder::Descending if next_key >= last_key.as_ref() => {
+                Some(SlateDBError::SeekKeyGreaterThanLastReturnedKey)
+            }
+            _ => None,
+        }
+    }
+
     fn maybe_invalidate<T: Clone>(
         &mut self,
         result: Result<T, SlateDBError>,
@@ -395,22 +413,22 @@ impl DbIterator {
         result
     }
 
-    /// Seek ahead to the next key. The next key must be larger than the
-    /// last key returned by the iterator and less than the end bound specified
-    /// in the `scan` arguments.
+    /// Seek ahead to the next key in the scan order. The next key must be
+    /// inside the range specified in the `scan` arguments.
     ///
-    /// After a successful seek, the iterator will return the next record
-    /// with a key greater than or equal to `next_key`.
+    /// For an ascending scan, the next key must be larger than the last key
+    /// returned by the iterator. After a successful seek, the iterator will
+    /// return the next record with a key greater than or equal to `next_key`.
     ///
-    /// Only supported for ascending scans. Descending scans return an error
-    /// because the merge and sorted-run iterators only seek in ascending order.
+    /// For a descending scan, the next key must be smaller than the last key
+    /// returned by the iterator. After a successful seek, the iterator will
+    /// return the next record with a key less than or equal to `next_key`.
     ///
     /// # Errors
     ///
     /// Returns an invalid argument error in the following cases:
     ///
-    /// - if the scan was opened with [`IterationOrder::Descending`]
-    /// - if `next_key` comes before the current iterator position
+    /// - if `next_key` comes before the current iterator position in the scan order
     /// - if `next_key` is beyond the upper bound specified in the original
     ///   [`crate::db::Db::scan`] parameters
     ///
@@ -419,20 +437,14 @@ impl DbIterator {
         let next_key = next_key.as_ref();
         if let Some(error) = self.invalidated_error.clone() {
             Err(error.into())
-        } else if matches!(self.order, IterationOrder::Descending) {
-            Err(SlateDBError::SeekNotSupportedForDescendingScan.into())
         } else if !self.range.contains(&next_key) {
             Err(SlateDBError::SeekKeyOutOfRange {
                 key: next_key.to_vec(),
                 range: self.range.clone(),
             }
             .into())
-        } else if self
-            .last_key
-            .clone()
-            .is_some_and(|last_key| next_key <= last_key)
-        {
-            Err(SlateDBError::SeekKeyLessThanLastReturnedKey.into())
+        } else if let Some(error) = self.rewind_error(next_key) {
+            Err(error.into())
         } else {
             let result = self.iter.seek(next_key).await;
             self.maybe_invalidate(result).map_err(Into::into)
@@ -782,6 +794,55 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::ascending(IterationOrder::Ascending, [b"a", b"b", b"c"])]
+    #[case::descending(IterationOrder::Descending, [b"c", b"b", b"a"])]
+    #[tokio::test]
+    async fn test_seek_after_merged_value(
+        #[case] order: IterationOrder,
+        #[case] keys: [&'static [u8; 1]; 3],
+        #[values(false, true)] skip_next_key: bool,
+    ) {
+        let [merged_key, next_key, last_key] = keys;
+        let mem_iter = TestIterator::new()
+            .with_order(order)
+            .with_row_entry(RowEntry::new_merge(merged_key, b"2", 2))
+            .with_row_entry(RowEntry::new_merge(merged_key, b"1", 1))
+            .with_entry(next_key, b"next", 3)
+            .with_entry(last_key, b"last", 4);
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            vec![Box::new(mem_iter) as Box<dyn RowEntryIterator>],
+            Box::new(EmptyIterator::new()),
+            None,
+            Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType),
+            order,
+            ReadTrace::none(),
+        )
+        .await
+        .unwrap();
+        let merged = iter.next().await.unwrap().unwrap();
+        assert_eq!(
+            (merged.key.as_ref(), merged.value.as_ref()),
+            (&merged_key[..], &b"12"[..])
+        );
+
+        // The merge read `next_key` ahead. A seek to it keeps the entry, and a seek past it drops it.
+        let (seek_key, expected): (&[u8], Vec<&[u8]>) = if skip_next_key {
+            (last_key, vec![last_key])
+        } else {
+            (next_key, vec![next_key, last_key])
+        };
+        iter.seek(seek_key).await.unwrap();
+
+        let mut got = Vec::new();
+        while let Some(kv) = iter.next().await.unwrap() {
+            got.push(kv.key);
+        }
+        assert_eq!(got, expected);
+    }
+
     #[tokio::test]
     async fn test_invalidated_iterator() {
         let mem_iters: VecDeque<Box<dyn RowEntryIterator + 'static>> = VecDeque::new();
@@ -891,6 +952,45 @@ mod tests {
         iter.seek(b"key2").await.unwrap();
         let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key, Bytes::from_static(b"key2"));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_descending_seek_cannot_rewind() {
+        let mem_iter = TestIterator::new()
+            .with_order(IterationOrder::Descending)
+            .with_entry(b"key2", b"value2", 2)
+            .with_entry(b"key1", b"value1", 1);
+
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            vec![Box::new(mem_iter) as Box<dyn RowEntryIterator + 'static>],
+            Box::new(EmptyIterator::new()),
+            None,
+            None,
+            IterationOrder::Descending,
+            ReadTrace::none(),
+        )
+        .await
+        .unwrap();
+
+        let first = iter.next().await.unwrap().unwrap();
+        assert_eq!(first.key, Bytes::from_static(b"key2"));
+
+        // In a descending scan, the current key and larger keys come before
+        // the current position.
+        for key in [b"key2".as_slice(), b"key3".as_slice()] {
+            let err = iter.seek(key).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Invalid error: cannot seek to a key greater than the last returned key"
+            );
+        }
+
+        iter.seek(b"key1").await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"key1"));
         assert!(iter.next().await.unwrap().is_none());
     }
 
